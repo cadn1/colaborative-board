@@ -1,32 +1,29 @@
 import { Liveblocks } from "@liveblocks/node";
+import { checkRoomAccess } from "@/lib/roomAccess";
 
-// Inicializamos Liveblocks con tu clave secreta de las variables de entorno
 const liveblocks = new Liveblocks({
   secret: process.env.LIVEBLOCKS_SECRET_KEY as string,
 });
 
 export async function POST(request: Request) {
   try {
-    // Obtenemos a qué sala intenta entrar el usuario
-    const body = await request.json();
-    const { room } = body;
-
-    // Creamos un usuario anónimo con un ID aleatorio
-    const session = liveblocks.prepareSession(
-      `anon_${Math.floor(Math.random() * 10000)}`
-    );
-
-    // Le damos acceso total (lectura y escritura) a esa sala específica
-    if (room) {
-      session.allow(room, session.FULL_ACCESS);
+    const { room, password } = await request.json();
+    if (!room || typeof room !== "string") {
+      return Response.json({ error: "forbidden", reason: "Falta la sala" }, { status: 400 });
     }
 
-    // Autorizamos y enviamos el token al frontend
-    const { status, body: authBody } = await session.authorize();
-    return new Response(authBody, { status });
+    const acceso = await checkRoomAccess(room, typeof password === "string" ? password : "");
+    if (acceso !== "ok") {
+      return Response.json({ error: "forbidden", reason: acceso }, { status: 403 });
+    }
 
+    const session = liveblocks.prepareSession(`anon_${crypto.randomUUID()}`);
+    session.allow(room, session.FULL_ACCESS);
+
+    const { status, body } = await session.authorize();
+    return new Response(body, { status });
   } catch (error) {
     console.error("Error en Liveblocks Auth:", error);
-    return new Response("Error de autorización", { status: 403 });
+    return Response.json({ error: "forbidden", reason: "Error de autorización" }, { status: 403 });
   }
 }
