@@ -201,7 +201,7 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
       faltan.forEach((id) => pidiendo.current.delete(id));
 
       // Puede que el otro usuario aún esté subiendo la imagen: reintentar
-      const llegaron = new Set(recibidos.map((f) => f.id));
+      const llegaron = new Set<string>(recibidos.map((f) => f.id));
       const aunFaltan = faltan.filter((id) => !llegaron.has(id));
       if (aunFaltan.length > 0 && intento < 6) {
         setTimeout(() => traerArchivos(aunFaltan, intento + 1), 1500);
