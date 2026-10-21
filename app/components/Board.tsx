@@ -20,11 +20,11 @@ import {
   useBroadcastEvent,
   useEventListener,
   useOthers,
+  useSelf,
   useUpdateMyPresence,
 } from "@liveblocks/react";
 import type { JsonObject } from "@liveblocks/client";
 
-// Tipo de la presencia (lo que cada usuario comparte en vivo)
 declare global {
   interface Liveblocks {
     Presence: {
@@ -32,11 +32,16 @@ declare global {
       nombre: string;
       color: string;
     };
+    UserMeta: {
+      id: string;
+      info: { admin: boolean };
+    };
   }
 }
 
 type LocalEls = Parameters<typeof reconcileElements>[0];
 type RemoteEls = Parameters<typeof reconcileElements>[1];
+type InfoSala = { admin: boolean; locked: boolean; banned: string[] };
 
 const COLORES = ["#e03131", "#2f9e44", "#1971c2", "#f08c00", "#9c36b5", "#0c8599"];
 
@@ -68,12 +73,40 @@ const estiloBoton: React.CSSProperties = {
   fontWeight: "bold",
   width: 260,
 };
+const estiloTop: React.CSSProperties = {
+  padding: "6px 12px",
+  color: "white",
+  border: "none",
+  borderRadius: 8,
+  cursor: "pointer",
+  fontWeight: "bold",
+};
+const estiloMini: React.CSSProperties = {
+  padding: "4px 10px",
+  color: "white",
+  border: "none",
+  borderRadius: 6,
+  cursor: "pointer",
+  fontSize: 12,
+  fontWeight: "bold",
+};
 
-const headersClave = (clave: string) => ({
+// Identidad estable de este navegador (la usan los baneos)
+function getUid(): string {
+  let v = localStorage.getItem("uid");
+  if (!v) {
+    v = crypto.randomUUID().replace(/-/g, "");
+    localStorage.setItem("uid", v);
+  }
+  return v;
+}
+
+const headersAuth = (clave: string, adminKey: string) => ({
   "x-room-password": encodeURIComponent(clave),
+  "x-admin-password": encodeURIComponent(adminKey),
+  "x-user-id": getUid(),
 });
 
-// fileIds de las imágenes (no borradas) que aparecen en una lista de elementos
 function idsDeImagenes(elements: readonly ExcalidrawElement[]): string[] {
   const ids = new Set<string>();
   for (const e of elements) {
@@ -85,19 +118,49 @@ function idsDeImagenes(elements: readonly ExcalidrawElement[]): string[] {
 // ---------------------------------------------------------------
 // PIZARRA
 // ---------------------------------------------------------------
-function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
+function Pizarra({
+  roomId,
+  clave,
+  adminKey,
+  inicial,
+}: {
+  roomId: string;
+  clave: string;
+  adminKey: string;
+  inicial: InfoSala;
+}) {
+  const esAdmin = inicial.admin;
   const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null);
   const [estado, setEstado] = useState("");
+  const [panel, setPanel] = useState(false);
+  const [bloqueada, setBloqueada] = useState(inicial.locked);
+  const [baneados, setBaneados] = useState<string[]>(inicial.banned);
+  const [expulsado, setExpulsado] = useState(false);
+
+  const bloqueadaRef = useRef(inicial.locked);
+  const baneadosRef = useRef(new Set<string>(inicial.banned));
   const known = useRef(new Map<string, number>());
   const loaded = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const contenedor = useRef<HTMLDivElement>(null);
   const eventosForzados = useRef(new WeakSet<Event>());
-  const subidos = useRef(new Set<string>()); // imágenes que ya están en el servidor
-  const pidiendo = useRef(new Set<string>()); // imágenes que estoy descargando
+  const subidos = useRef(new Set<string>());
+  const pidiendo = useRef(new Set<string>());
+
   const broadcast = useBroadcastEvent();
   const updateMyPresence = useUpdateMyPresence();
   const others = useOthers();
+  const miId = useSelf((me) => me.id);
+
+  const aplicarLock = (v: boolean) => {
+    bloqueadaRef.current = v;
+    setBloqueada(v);
+  };
+  const aplicarBan = (id: string, v: boolean) => {
+    if (v) baneadosRef.current.add(id);
+    else baneadosRef.current.delete(id);
+    setBaneados([...baneadosRef.current]);
+  };
 
   // --- GUARDAR en MongoDB ---
   const guardar = useCallback(async () => {
@@ -109,48 +172,40 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
     try {
       const res = await fetch("/api/board", {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...headersClave(clave) },
+        headers: { "Content-Type": "application/json", ...headersAuth(clave, adminKey) },
         body: JSON.stringify({ roomId, document: { elements } }),
       });
-      setEstado(res.ok ? "Guardado ✔" : "Error al guardar");
+      setEstado(
+        res.ok ? "Guardado ✔" : res.status === 403 ? "Sala bloqueada" : "Error al guardar"
+      );
     } catch {
       setEstado("Error al guardar");
     }
-  }, [api, roomId, clave]);
+  }, [api, roomId, clave, adminKey]);
 
-  // --- SUBIR imágenes nuevas al servidor ---
+  // --- SUBIR imágenes nuevas ---
   const subirArchivos = useCallback(
     async (elements: readonly ExcalidrawElement[], files: BinaryFiles) => {
       for (const id of idsDeImagenes(elements)) {
         const f = files[id];
         if (!f || subidos.current.has(id)) continue;
-        subidos.current.add(id); // marcar antes para no duplicar
+        subidos.current.add(id);
 
         try {
           const res = await fetch("/api/files", {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...headersClave(clave),
-            },
+            headers: { "Content-Type": "application/json", ...headersAuth(clave, adminKey) },
             body: JSON.stringify({
               roomId,
-              file: {
-                id: f.id,
-                mimeType: f.mimeType,
-                dataURL: f.dataURL,
-                created: f.created,
-              },
+              file: { id: f.id, mimeType: f.mimeType, dataURL: f.dataURL, created: f.created },
             }),
           });
           if (!res.ok) {
-            setEstado(
-              res.status === 413
-                ? "Imagen demasiado grande (máx. ~4 MB)"
-                : "Error al subir la imagen"
-            );
-            // reintentar más tarde, salvo si es demasiado grande
-            if (res.status !== 413) {
+            if (res.status === 413) setEstado("Imagen demasiado grande (máx. ~4 MB)");
+            else if (res.status === 429) setEstado("Límite de imágenes de la sala alcanzado");
+            else if (res.status === 403) setEstado("Sala bloqueada");
+            else {
+              setEstado("Error al subir la imagen");
               setTimeout(() => subidos.current.delete(id), 5000);
             }
           }
@@ -160,7 +215,7 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
         }
       }
     },
-    [roomId, clave]
+    [roomId, clave, adminKey]
   );
 
   // --- DESCARGAR imágenes que me faltan ---
@@ -168,9 +223,7 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
     async (ids: string[], intento = 0) => {
       if (!api) return;
       const tengo = api.getFiles();
-      const faltan = ids.filter(
-        (id) => !tengo[id] && !pidiendo.current.has(id)
-      );
+      const faltan = ids.filter((id) => !tengo[id] && !pidiendo.current.has(id));
       if (faltan.length === 0) return;
       faltan.forEach((id) => pidiendo.current.add(id));
 
@@ -179,7 +232,7 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
           try {
             const res = await fetch(
               `/api/files?roomId=${encodeURIComponent(roomId)}&fileId=${encodeURIComponent(id)}`,
-              { headers: headersClave(clave) }
+              { headers: headersAuth(clave, adminKey) }
             );
             if (!res.ok) return null;
             const { file } = await res.json();
@@ -190,9 +243,7 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
         })
       );
 
-      const recibidos = resultados.filter(
-        (f): f is BinaryFileData => f !== null
-      );
+      const recibidos = resultados.filter((f): f is BinaryFileData => f !== null);
       if (recibidos.length > 0) {
         recibidos.forEach((f) => subidos.current.add(f.id));
         api.addFiles(recibidos);
@@ -200,15 +251,15 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
 
       faltan.forEach((id) => pidiendo.current.delete(id));
 
-      // Puede que el otro usuario aún esté subiendo la imagen: reintentar
       const llegaron = new Set<string>(recibidos.map((f) => f.id));
       const aunFaltan = faltan.filter((id) => !llegaron.has(id));
       if (aunFaltan.length > 0 && intento < 6) {
         setTimeout(() => traerArchivos(aunFaltan, intento + 1), 1500);
       }
     },
-    [api, roomId, clave]
+    [api, roomId, clave, adminKey]
   );
+
 
   // --- CARGAR desde MongoDB ---
   useEffect(() => {
@@ -216,16 +267,14 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
     let cancelled = false;
 
     fetch(`/api/board?roomId=${encodeURIComponent(roomId)}`, {
-      headers: headersClave(clave),
+      headers: headersAuth(clave, adminKey),
     })
       .then((r) => r.json())
       .then((data) => {
         if (cancelled) return;
         const saved = data?.document?.elements;
         if (Array.isArray(saved)) {
-          saved.forEach((e: ExcalidrawElement) =>
-            known.current.set(e.id, e.version)
-          );
+          saved.forEach((e: ExcalidrawElement) => known.current.set(e.id, e.version));
           api.updateScene({
             elements: saved,
             captureUpdate: CaptureUpdateAction.NEVER,
@@ -241,13 +290,41 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
     return () => {
       cancelled = true;
     };
-  }, [api, roomId, clave, traerArchivos]);
+  }, [api, roomId, clave, adminKey, traerArchivos]);
 
-  // --- RECIBIR cambios de otros usuarios (Liveblocks) ---
-  useEventListener(({ event }) => {
+  // --- RECIBIR eventos de otros usuarios ---
+  useEventListener(({ event, user }) => {
     if (!api) return;
-    const e = event as unknown as { type?: string; elements?: unknown[] };
+    const e = event as unknown as {
+      type?: string;
+      elements?: unknown[];
+      locked?: boolean;
+      userId?: string;
+    };
+    const emisorAdmin = !!user?.info?.admin;
+    const emisorId = user?.id;
+
+    // Órdenes de admin: solo se aceptan si el emisor es admin (verificado por el servidor)
+    if (e.type === "lock" || e.type === "ban" || e.type === "unban" || e.type === "clear") {
+      if (!emisorAdmin) return;
+
+      if (e.type === "lock") aplicarLock(!!e.locked);
+      if (e.type === "ban" && typeof e.userId === "string") {
+        aplicarBan(e.userId, true);
+        if (e.userId === miId && !esAdmin) setExpulsado(true);
+      }
+      if (e.type === "unban" && typeof e.userId === "string") aplicarBan(e.userId, false);
+      if (e.type === "clear") {
+        known.current.clear();
+        api.updateScene({ elements: [], captureUpdate: CaptureUpdateAction.NEVER });
+      }
+      return;
+    }
+
     if (e.type !== "elements" || !Array.isArray(e.elements)) return;
+    if (!emisorId) return;
+    if (baneadosRef.current.has(emisorId)) return;       // ignorar baneados
+    if (bloqueadaRef.current && !emisorAdmin) return;     // sala bloqueada: solo el admin edita
 
     const merged = reconcileElements(
       api.getSceneElementsIncludingDeleted() as unknown as LocalEls,
@@ -255,12 +332,8 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
       api.getAppState()
     );
     merged.forEach((el) => known.current.set(el.id, el.version));
-    api.updateScene({
-      elements: merged,
-      captureUpdate: CaptureUpdateAction.NEVER,
-    });
+    api.updateScene({ elements: merged, captureUpdate: CaptureUpdateAction.NEVER });
 
-    // si llegaron imágenes nuevas, bajarlas
     traerArchivos(idsDeImagenes(e.elements as unknown as ExcalidrawElement[]));
   });
 
@@ -269,27 +342,26 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
     if (!api) return;
     const collaborators = new Map();
     others.forEach((o) => {
+      if (baneados.includes(o.id)) return;
+      const nombre = o.presence.nombre;
       collaborators.set(String(o.connectionId), {
         pointer: o.presence.pointer ?? undefined,
-        username: o.presence.nombre,
+        username: o.info?.admin ? `🛡️ ${nombre}` : nombre,
         color: { background: o.presence.color, stroke: o.presence.color },
       });
     });
     api.updateScene({ collaborators });
-  }, [others, api]);
+  }, [others, api, baneados]);
 
-  // --- ENVIAR mis cambios + subir imágenes + autoguardado ---
+  // --- ENVIAR mis cambios + imágenes + autoguardado ---
   const onChange = (
     elements: readonly ExcalidrawElement[],
     _appState: unknown,
     files: BinaryFiles
   ) => {
-    // imágenes nuevas -> al servidor (aunque no haya otros cambios)
     subirArchivos(elements, files);
 
-    const changed = elements.filter(
-      (el) => known.current.get(el.id) !== el.version
-    );
+    const changed = elements.filter((el) => known.current.get(el.id) !== el.version);
     if (changed.length === 0) return;
 
     changed.forEach((el) => known.current.set(el.id, el.version));
@@ -304,6 +376,57 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
   }, []);
+
+  // --- ACCIONES DE ADMIN ---
+  const accionAdmin = async (body: Record<string, unknown>) => {
+    try {
+      const res = await fetch("/api/admin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headersAuth(clave, adminKey) },
+        body: JSON.stringify({ roomId, ...body }),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  };
+
+  const alternarBloqueo = async () => {
+    const nuevo = !bloqueada;
+    if (!(await accionAdmin({ action: "lock", locked: nuevo }))) {
+      return setEstado("No se pudo cambiar el bloqueo");
+    }
+    aplicarLock(nuevo);
+    broadcast({ type: "lock", locked: nuevo } as unknown as JsonObject);
+  };
+
+  const expulsar = async (userId: string) => {
+    if (!(await accionAdmin({ action: "ban", userId }))) {
+      return setEstado("No se pudo expulsar");
+    }
+    aplicarBan(userId, true);
+    broadcast({ type: "ban", userId } as unknown as JsonObject);
+  };
+
+  const perdonar = async (userId: string) => {
+    if (!(await accionAdmin({ action: "unban", userId }))) {
+      return setEstado("No se pudo desbanear");
+    }
+    aplicarBan(userId, false);
+    broadcast({ type: "unban", userId } as unknown as JsonObject);
+  };
+
+  const limpiarPizarra = async () => {
+    if (!confirm("¿Borrar TODO el contenido de la pizarra para todos?")) return;
+    if (!(await accionAdmin({ action: "clear" }))) {
+      return setEstado("No se pudo limpiar");
+    }
+    known.current.clear();
+    subidos.current.clear();
+    api?.updateScene({ elements: [], captureUpdate: CaptureUpdateAction.NEVER });
+    broadcast({ type: "clear" } as unknown as JsonObject);
+    setEstado("Pizarra limpiada ✔");
+  };
 
   // --- RUEDA DEL MOUSE = ZOOM ---
   useEffect(() => {
@@ -407,50 +530,154 @@ function Pizarra({ roomId, clave }: { roomId: string; clave: string }) {
     };
   }, [api]);
 
+  if (expulsado) {
+    return (
+      <div style={estiloCentro}>
+        <h2>🚫 Fuiste expulsado de esta sala</h2>
+        <button onClick={() => (window.location.href = "/")} style={estiloBoton}>
+          Volver al inicio
+        </button>
+      </div>
+    );
+  }
+
+  const soloLectura = bloqueada && !esAdmin;
+
+  // Usuarios conectados (sin admins, sin baneados, sin duplicados)
+  const conectados = new Map<string, string>();
+  others.forEach((o) => {
+    if (!o.info?.admin && !baneados.includes(o.id)) {
+      conectados.set(o.id, o.presence.nombre);
+    }
+  });
+
   return (
     <div
       ref={contenedor}
-      style={{ width: "100vw", height: "100vh" }}
+      style={{ width: "100vw", height: "100vh", position: "relative" }}
       onPointerLeave={() => updateMyPresence({ pointer: null })}
     >
       <Excalidraw
         excalidrawAPI={setApi}
         onChange={onChange}
         onPointerUpdate={({ pointer }) => updateMyPresence({ pointer })}
+        viewModeEnabled={soloLectura}
         renderTopRightUI={() => (
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 12 }}>{estado}</span>
-            <button
-              onClick={guardar}
-              style={{
-                padding: "6px 12px",
-                background: "#0070f3",
-                color: "white",
-                border: "none",
-                borderRadius: 8,
-                cursor: "pointer",
-                fontWeight: "bold",
-              }}
-            >
-              💾 Guardar
-            </button>
-          </div>
-        )}
+  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+    <span style={{ fontSize: 12 }}>
+      {soloLectura ? "🔒 Sala bloqueada · " : ""}
+      {estado}
+    </span>
+    {!soloLectura && (
+      <button onClick={guardar} style={{ ...estiloTop, background: "#0070f3" }}>
+        💾 Guardar
+      </button>
+    )}
+    {esAdmin && (
+      <button
+        onClick={() => setPanel((p) => !p)}
+        style={{ ...estiloTop, background: "#c92a2a" }}
+      >
+        🛡️ Admin
+      </button>
+    )}
+  </div>
+)}
       />
+
+      {esAdmin && panel && (
+        <div
+          style={{
+            position: "absolute",
+            top: 60,
+            right: 12,
+            zIndex: 20,
+            width: 290,
+            maxHeight: "70vh",
+            overflowY: "auto",
+            background: "#fff",
+            color: "#111",
+            borderRadius: 12,
+            padding: 12,
+            boxShadow: "0 4px 16px rgba(0,0,0,.3)",
+            fontFamily: "sans-serif",
+            fontSize: 14,
+            display: "flex",
+            flexDirection: "column",
+            gap: 10,
+          }}
+        >
+          <strong>🛡️ Panel de admin</strong>
+
+          <button
+            onClick={alternarBloqueo}
+            style={{ ...estiloMini, background: bloqueada ? "#2f9e44" : "#f08c00", padding: "8px 10px" }}
+          >
+            {bloqueada ? "🔓 Desbloquear sala" : "🔒 Bloquear sala (solo lectura)"}
+          </button>
+
+          <button
+            onClick={limpiarPizarra}
+            style={{ ...estiloMini, background: "#c92a2a", padding: "8px 10px" }}
+          >
+            🧹 Limpiar toda la pizarra
+          </button>
+
+          <div>
+            <strong>Conectados ({conectados.size})</strong>
+            {conectados.size === 0 && (
+              <div style={{ color: "#777", fontSize: 12 }}>Nadie más conectado</div>
+            )}
+            {[...conectados].map(([id, nombre]) => (
+              <div
+                key={id}
+                style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4, gap: 6 }}
+              >
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {nombre}
+                </span>
+                <button onClick={() => expulsar(id)} style={{ ...estiloMini, background: "#c92a2a" }}>
+                  Expulsar
+                </button>
+              </div>
+            ))}
+          </div>
+
+          {baneados.length > 0 && (
+            <div>
+              <strong>Expulsados ({baneados.length})</strong>
+              {baneados.map((id) => (
+                <div
+                  key={id}
+                  style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4, gap: 6 }}
+                >
+                  <span style={{ fontSize: 12, color: "#555" }}>…{id.slice(-6)}</span>
+                  <button onClick={() => perdonar(id)} style={{ ...estiloMini, background: "#2f9e44" }}>
+                    Desbanear
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
 // ---------------------------------------------------------------
-// PUERTA DE ENTRADA A LA SALA (verifica contraseña si la hay)
+// PUERTA DE ENTRADA A LA SALA
 // ---------------------------------------------------------------
 function SalaGate({ sala }: { sala: string }) {
-  const [fase, setFase] = useState<"cargando" | "pedir" | "ok">("cargando");
+  const [fase, setFase] = useState<"cargando" | "pedir" | "ok" | "baneado" | "error">("cargando");
   const [clave, setClave] = useState("");
   const [input, setInput] = useState("");
   const [error, setError] = useState("");
+  const [info, setInfo] = useState<InfoSala>({ admin: false, locked: false, banned: [] });
 
-  // Identidad para los cursores (se genera una vez)
+  const [adminKey] = useState(() => localStorage.getItem(`admin:${sala}`) ?? "");
+  const [uid] = useState(() => getUid());
+
   const [yo] = useState(() => ({
     pointer: null,
     nombre:
@@ -463,25 +690,36 @@ function SalaGate({ sala }: { sala: string }) {
     async (pw: string) => {
       try {
         const res = await fetch(`/api/rooms?roomId=${encodeURIComponent(sala)}`, {
-          headers: headersClave(pw),
+          headers: headersAuth(pw, adminKey),
         });
-        const { access } = await res.json();
-        if (access === "ok") {
+        const data = await res.json();
+
+        if (data.access === "ok") {
           sessionStorage.setItem(`pw:${sala}`, pw);
           setClave(pw);
+          setInfo({
+            admin: !!data.admin,
+            locked: !!data.locked,
+            banned: Array.isArray(data.banned) ? data.banned : [],
+          });
           setError("");
           setFase("ok");
-        } else {
+        } else if (data.access === "banned") {
+          setFase("baneado");
+        } else if (data.access === "needs-password" || data.access === "wrong-password") {
           sessionStorage.removeItem(`pw:${sala}`);
-          setError(access === "wrong-password" ? "Contraseña incorrecta" : "");
+          setError(data.access === "wrong-password" ? "Contraseña incorrecta" : "");
           setFase("pedir");
+        } else {
+          setError(`Error del servidor (${res.status})`);
+          setFase("error");
         }
       } catch {
         setError("No se pudo verificar la sala");
-        setFase("pedir");
+        setFase("error");
       }
     },
-    [sala]
+    [sala, adminKey]
   );
 
   useEffect(() => {
@@ -492,12 +730,35 @@ function SalaGate({ sala }: { sala: string }) {
     return <div style={estiloCentro}>Cargando pizarra colaborativa...</div>;
   }
 
+  if (fase === "baneado") {
+    return (
+      <div style={estiloCentro}>
+        <h2>🚫 Fuiste expulsado de esta sala</h2>
+        <button onClick={() => (window.location.href = "/")} style={estiloBoton}>
+          Volver al inicio
+        </button>
+      </div>
+    );
+  }
+
+  if (fase === "error") {
+    return (
+      <div style={estiloCentro}>
+        <h2>⚠️ {error}</h2>
+        <button onClick={() => verificar("")} style={estiloBoton}>
+          Reintentar
+        </button>
+      </div>
+    );
+  }
+
   if (fase === "pedir") {
     return (
       <div style={estiloCentro}>
         <h2>🔒 Sala privada: {sala}</h2>
         <input
           type="password"
+          autoComplete="new-password"
           placeholder="Contraseña"
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -512,39 +773,38 @@ function SalaGate({ sala }: { sala: string }) {
     );
   }
 
+  const adminEfectivo = info.admin ? adminKey : "";
+
   return (
     <LiveblocksProvider
       authEndpoint={async (room) => {
         const res = await fetch("/api/liveblocks-auth", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ room, password: clave }),
+          body: JSON.stringify({ room, password: clave, adminPassword: adminEfectivo, uid }),
         });
         return await res.json();
       }}
     >
       <RoomProvider id={sala} initialPresence={yo}>
-        <Pizarra roomId={sala} clave={clave} />
+        <Pizarra roomId={sala} clave={clave} adminKey={adminEfectivo} inicial={info} />
       </RoomProvider>
     </LiveblocksProvider>
   );
 }
 
 // ---------------------------------------------------------------
-// LOBBY: crear o entrar a una sala
+// LOBBY
 // ---------------------------------------------------------------
 function Lobby() {
   const router = useRouter();
   const [nombreSala, setNombreSala] = useState("");
   const [clave, setClave] = useState("");
-  const [tuNombre, setTuNombre] = useState(
-    () => localStorage.getItem("nombre") ?? ""
-  );
+  const [adminPw, setAdminPw] = useState("");
+  const [tuNombre, setTuNombre] = useState(() => localStorage.getItem("nombre") ?? "");
   const [error, setError] = useState("");
 
-  const limpiar = (s: string) =>
-    s.trim().replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 64);
-
+  const limpiar = (s: string) => s.trim().replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 64);
   const guardarNombre = () => localStorage.setItem("nombre", tuNombre.trim());
 
   const crear = async () => {
@@ -554,7 +814,7 @@ function Lobby() {
     const res = await fetch("/api/rooms", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ roomId: id, password: clave }),
+      body: JSON.stringify({ roomId: id, password: clave, adminPassword: adminPw }),
     });
     if (res.status === 409) return setError("Esa sala ya existe");
     if (!res.ok) {
@@ -562,6 +822,7 @@ function Lobby() {
       return setError(data?.error ?? "No se pudo crear la sala");
     }
     if (clave) sessionStorage.setItem(`pw:${id}`, clave);
+    if (adminPw) localStorage.setItem(`admin:${id}`, adminPw);
     router.push(`/?sala=${id}`);
   };
 
@@ -570,6 +831,7 @@ function Lobby() {
     guardarNombre();
     const id = limpiar(nombreSala);
     if (!id) return setError("Escribe el nombre de la sala");
+    if (adminPw) localStorage.setItem(`admin:${id}`, adminPw);
     router.push(`/?sala=${id}`);
   };
 
@@ -590,9 +852,18 @@ function Lobby() {
       />
       <input
         type="password"
-        placeholder="Contraseña (opcional, para crear)"
+        autoComplete="new-password"
+        placeholder="Contraseña de la sala (opcional)"
         value={clave}
         onChange={(e) => setClave(e.target.value)}
+        style={estiloInput}
+      />
+      <input
+        type="password"
+        autoComplete="new-password"
+        placeholder="Contraseña de admin (crear o entrar como admin)"
+        value={adminPw}
+        onChange={(e) => setAdminPw(e.target.value)}
         style={estiloInput}
       />
       <button onClick={crear} style={estiloBoton}>

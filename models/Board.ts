@@ -1,14 +1,12 @@
 import mongoose from "mongoose";
 
-const BoardFileSchema = new mongoose.Schema({
-  roomId: { type: String, required: true },
-  fileId: { type: String, required: true },
-  mimeType: { type: String, required: true },
-  dataURL: { type: String, required: true },
-  created: { type: Number, default: () => Date.now() },
+const BoardSchema = new mongoose.Schema({
+  roomId: { type: String, required: true, unique: true },
+  document: { type: Object, default: null },
+  passwordHash: { type: String, default: null },
+  adminHash: { type: String, default: null },
+  locked: { type: Boolean, default: false },
+  banned: { type: [String], default: [] },
 });
 
-BoardFileSchema.index({ roomId: 1, fileId: 1 }, { unique: true });
-
-export default mongoose.models.BoardFile ||
-  mongoose.model("BoardFile", BoardFileSchema);
+export default mongoose.models.Board || mongoose.model("Board", BoardSchema);
