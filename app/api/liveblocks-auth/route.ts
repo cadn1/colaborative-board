@@ -20,7 +20,7 @@ export async function POST(request: Request) {
       }
     }
 
-    const { locked, banned } = await estadoSala(room);
+    const { locked, banned, muted } = await estadoSala(room);
 
     const userId =
       typeof uid === "string" && /^[a-zA-Z0-9_-]{8,64}$/.test(uid)
@@ -31,9 +31,10 @@ export async function POST(request: Request) {
       return Response.json({ error: "forbidden", reason: "banned" }, { status: 403 });
     }
 
-    // info.admin lo fija el servidor: los demás clientes pueden confiar en él
+    const puedeEditar = admin || (!locked && !muted.includes(userId));
+
     const session = liveblocks.prepareSession(userId, { userInfo: { admin } });
-    session.allow(room, admin || !locked ? session.FULL_ACCESS : session.READ_ACCESS);
+    session.allow(room, puedeEditar ? session.FULL_ACCESS : session.READ_ACCESS);
 
     const { status, body } = await session.authorize();
     return new Response(body, { status });

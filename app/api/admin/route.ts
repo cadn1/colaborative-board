@@ -24,13 +24,17 @@ export async function POST(request: Request) {
       await Board.updateOne({ roomId }, { $set: { locked: !!locked } });
       break;
     case "ban":
-    case "unban": {
+    case "unban":
+    case "mute":
+    case "unmute": {
       if (typeof userId !== "string" || !USER_ID.test(userId)) {
         return NextResponse.json({ error: "userId inválido" }, { status: 400 });
       }
+      const campo = action === "ban" || action === "unban" ? "banned" : "muted";
+      const agregar = action === "ban" || action === "mute";
       await Board.updateOne(
         { roomId },
-        action === "ban" ? { $addToSet: { banned: userId } } : { $pull: { banned: userId } }
+        agregar ? { $addToSet: { [campo]: userId } } : { $pull: { [campo]: userId } }
       );
       break;
     }

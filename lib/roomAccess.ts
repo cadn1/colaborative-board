@@ -52,12 +52,15 @@ export async function esAdmin(roomId: string, adminPassword: string): Promise<bo
   return verifyPassword(adminPassword, board.adminHash);
 }
 
-export async function estadoSala(roomId: string): Promise<{ locked: boolean; banned: string[] }> {
+export async function estadoSala(
+  roomId: string
+): Promise<{ locked: boolean; banned: string[]; muted: string[] }> {
   await connectToDatabase();
-  const board = await Board.findOne({ roomId }).select("locked banned");
+  const board = await Board.findOne({ roomId }).select("locked banned muted");
   return {
     locked: !!board?.locked,
     banned: Array.isArray(board?.banned) ? (board.banned as string[]) : [],
+    muted: Array.isArray(board?.muted) ? (board.muted as string[]) : [],
   };
 }
 
@@ -76,8 +79,11 @@ export async function puedeLeer(roomId: string, request: Request): Promise<boole
 
 export async function puedeEscribir(roomId: string, request: Request): Promise<Permiso> {
   if (await esAdmin(roomId, leerAdmin(request))) return "ok";
-  if (await estaBaneado(roomId, leerUid(request))) return "unauthorized";
+  const uid = leerUid(request);
+  if (await estaBaneado(roomId, uid)) return "unauthorized";
   if ((await checkRoomAccess(roomId, leerClave(request))) !== "ok") return "unauthorized";
-  const { locked } = await estadoSala(roomId);
-  return locked ? "locked" : "ok";
+  const { locked, muted } = await estadoSala(roomId);
+  if (locked) return "locked";
+  if (uid && muted.includes(`u_${uid}`)) return "locked"; // silenciado: también se rechaza
+  return "ok";
 }

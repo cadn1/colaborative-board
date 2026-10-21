@@ -24,14 +24,16 @@ export async function GET(request: Request) {
   const admin = await esAdmin(roomId, leerAdmin(request));
 
   if (!admin && (await estaBaneado(roomId, leerUid(request)))) {
-    return NextResponse.json({ access: "banned", admin: false, locked: false, banned: [] });
+    return NextResponse.json({ access: "banned", admin: false, locked: false, banned: [], muted: [] });
   }
 
   const access = admin ? "ok" : await checkRoomAccess(roomId, leerClave(request));
-  const { locked, banned } =
-    access === "ok" ? await estadoSala(roomId) : { locked: false, banned: [] as string[] };
+  const { locked, banned, muted } =
+    access === "ok"
+      ? await estadoSala(roomId)
+      : { locked: false, banned: [] as string[], muted: [] as string[] };
 
-  return NextResponse.json({ access, admin, locked, banned });
+  return NextResponse.json({ access, admin, locked, banned, muted });
 }
 
 // Crear sala (contraseña y contraseña de admin opcionales)

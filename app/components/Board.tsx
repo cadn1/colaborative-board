@@ -41,7 +41,7 @@ declare global {
 
 type LocalEls = Parameters<typeof reconcileElements>[0];
 type RemoteEls = Parameters<typeof reconcileElements>[1];
-type InfoSala = { admin: boolean; locked: boolean; banned: string[] };
+type InfoSala = { admin: boolean; locked: boolean; banned: string[]; muted: string[] };
 
 const COLORES = ["#e03131", "#2f9e44", "#1971c2", "#f08c00", "#9c36b5", "#0c8599"];
 
@@ -135,6 +135,8 @@ function Pizarra({
   const [panel, setPanel] = useState(false);
   const [bloqueada, setBloqueada] = useState(inicial.locked);
   const [baneados, setBaneados] = useState<string[]>(inicial.banned);
+  const [silenciados, setSilenciados] = useState<string[]>(inicial.muted);
+  const silenciadosRef = useRef(new Set<string>(inicial.muted));
   const [expulsado, setExpulsado] = useState(false);
 
   const bloqueadaRef = useRef(inicial.locked);
@@ -161,6 +163,11 @@ function Pizarra({
     else baneadosRef.current.delete(id);
     setBaneados([...baneadosRef.current]);
   };
+  const aplicarMute = (id: string, v: boolean) => {
+  if (v) silenciadosRef.current.add(id);
+  else silenciadosRef.current.delete(id);
+  setSilenciados([...silenciadosRef.current]);
+};
 
   // --- GUARDAR en MongoDB ---
   const guardar = useCallback(async () => {
@@ -305,25 +312,31 @@ function Pizarra({
     const emisorId = user?.id;
 
     // Órdenes de admin: solo se aceptan si el emisor es admin (verificado por el servidor)
-    if (e.type === "lock" || e.type === "ban" || e.type === "unban" || e.type === "clear") {
-      if (!emisorAdmin) return;
+    if (
+  e.type === "lock" || e.type === "ban" || e.type === "unban" ||
+  e.type === "mute" || e.type === "unmute" || e.type === "clear"
+) {
+  if (!emisorAdmin) return;
 
-      if (e.type === "lock") aplicarLock(!!e.locked);
-      if (e.type === "ban" && typeof e.userId === "string") {
-        aplicarBan(e.userId, true);
-        if (e.userId === miId && !esAdmin) setExpulsado(true);
-      }
-      if (e.type === "unban" && typeof e.userId === "string") aplicarBan(e.userId, false);
-      if (e.type === "clear") {
-        known.current.clear();
-        api.updateScene({ elements: [], captureUpdate: CaptureUpdateAction.NEVER });
-      }
-      return;
-    }
+  if (e.type === "lock") aplicarLock(!!e.locked);
+  if (e.type === "ban" && typeof e.userId === "string") {
+    aplicarBan(e.userId, true);
+    if (e.userId === miId && !esAdmin) setExpulsado(true);
+  }
+  if (e.type === "unban" && typeof e.userId === "string") aplicarBan(e.userId, false);
+  if (e.type === "mute" && typeof e.userId === "string") aplicarMute(e.userId, true);
+  if (e.type === "unmute" && typeof e.userId === "string") aplicarMute(e.userId, false);
+  if (e.type === "clear") {
+    known.current.clear();
+    api.updateScene({ elements: [], captureUpdate: CaptureUpdateAction.NEVER });
+  }
+  return;
+}
 
     if (e.type !== "elements" || !Array.isArray(e.elements)) return;
     if (!emisorId) return;
     if (baneadosRef.current.has(emisorId)) return;       // ignorar baneados
+    if (silenciadosRef.current.has(emisorId) && !emisorAdmin) return; // silenciado: se ignora lo que envíe
     if (bloqueadaRef.current && !emisorAdmin) return;     // sala bloqueada: solo el admin edita
 
     const merged = reconcileElements(
@@ -415,6 +428,21 @@ function Pizarra({
     aplicarBan(userId, false);
     broadcast({ type: "unban", userId } as unknown as JsonObject);
   };
+  const silenciar = async (userId: string) => {
+  if (!(await accionAdmin({ action: "mute", userId }))) {
+    return setEstado("No se pudo silenciar");
+  }
+  aplicarMute(userId, true);
+  broadcast({ type: "mute", userId } as unknown as JsonObject);
+};
+
+const permitir = async (userId: string) => {
+  if (!(await accionAdmin({ action: "unmute", userId }))) {
+    return setEstado("No se pudo dar permiso");
+  }
+  aplicarMute(userId, false);
+  broadcast({ type: "unmute", userId } as unknown as JsonObject);
+};
 
   const limpiarPizarra = async () => {
     if (!confirm("¿Borrar TODO el contenido de la pizarra para todos?")) return;
@@ -541,7 +569,8 @@ function Pizarra({
     );
   }
 
-  const soloLectura = bloqueada && !esAdmin;
+  const yoSilenciado = !!miId && silenciados.includes(miId);
+const soloLectura = (bloqueada || yoSilenciado) && !esAdmin;
 
   // Usuarios conectados (sin admins, sin baneados, sin duplicados)
   const conectados = new Map<string, string>();
@@ -565,9 +594,13 @@ function Pizarra({
         renderTopRightUI={() => (
   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
     <span style={{ fontSize: 12 }}>
-      {soloLectura ? "🔒 Sala bloqueada · " : ""}
-      {estado}
-    </span>
+    {soloLectura
+    ? bloqueada
+      ? "🔒 Sala bloqueada · "
+      : "👁️ Solo puedes mirar · "
+    : ""}
+  {estado}
+</span>
     {!soloLectura && (
       <button onClick={guardar} style={{ ...estiloTop, background: "#0070f3" }}>
         💾 Guardar
@@ -624,24 +657,55 @@ function Pizarra({
           </button>
 
           <div>
-            <strong>Conectados ({conectados.size})</strong>
-            {conectados.size === 0 && (
-              <div style={{ color: "#777", fontSize: 12 }}>Nadie más conectado</div>
-            )}
-            {[...conectados].map(([id, nombre]) => (
-              <div
-                key={id}
-                style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4, gap: 6 }}
-              >
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {nombre}
-                </span>
-                <button onClick={() => expulsar(id)} style={{ ...estiloMini, background: "#c92a2a" }}>
-                  Expulsar
-                </button>
-              </div>
-            ))}
-          </div>
+  <strong>Conectados ({conectados.size})</strong>
+  {conectados.size === 0 && (
+    <div style={{ color: "#777", fontSize: 12 }}>Nadie más conectado</div>
+  )}
+  {[...conectados].map(([id, nombre]) => {
+    const mudo = silenciados.includes(id);
+    return (
+      <div
+        key={id}
+        style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4, gap: 6 }}
+      >
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {mudo ? "👁️ " : ""}
+          {nombre}
+        </span>
+        <span style={{ display: "flex", gap: 4 }}>
+          <button
+            onClick={() => (mudo ? permitir(id) : silenciar(id))}
+            style={{ ...estiloMini, background: mudo ? "#2f9e44" : "#f08c00" }}
+          >
+            {mudo ? "Permitir" : "Silenciar"}
+          </button>
+          <button onClick={() => expulsar(id)} style={{ ...estiloMini, background: "#c92a2a" }}>
+            Expulsar
+          </button>
+        </span>
+      </div>
+    );
+  })}
+</div>
+
+{silenciados.filter((id) => !conectados.has(id)).length > 0 && (
+  <div>
+    <strong>Silenciados desconectados</strong>
+    {silenciados
+      .filter((id) => !conectados.has(id))
+      .map((id) => (
+        <div
+          key={id}
+          style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4, gap: 6 }}
+        >
+          <span style={{ fontSize: 12, color: "#555" }}>…{id.slice(-6)}</span>
+          <button onClick={() => permitir(id)} style={{ ...estiloMini, background: "#2f9e44" }}>
+            Permitir
+          </button>
+        </div>
+      ))}
+  </div>
+)}
 
           {baneados.length > 0 && (
             <div>
@@ -673,7 +737,7 @@ function SalaGate({ sala }: { sala: string }) {
   const [clave, setClave] = useState("");
   const [input, setInput] = useState("");
   const [error, setError] = useState("");
-  const [info, setInfo] = useState<InfoSala>({ admin: false, locked: false, banned: [] });
+  const [info, setInfo] = useState<InfoSala>({ admin: false, locked: false, banned: [], muted: [] });
 
   const [adminKey] = useState(() => localStorage.getItem(`admin:${sala}`) ?? "");
   const [uid] = useState(() => getUid());
@@ -701,7 +765,8 @@ function SalaGate({ sala }: { sala: string }) {
             admin: !!data.admin,
             locked: !!data.locked,
             banned: Array.isArray(data.banned) ? data.banned : [],
-          });
+            muted: Array.isArray(data.muted) ? data.muted : [],
+});
           setError("");
           setFase("ok");
         } else if (data.access === "banned") {
